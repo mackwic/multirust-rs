@@ -9,6 +9,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::thread;
 use hyper::{self, Client};
+use hyper::header::{Header, Range, BytesRangeSpec};
 use openssl::crypto::hash::Hasher;
 
 use rand::random;
@@ -162,33 +163,66 @@ impl fmt::Display for DownloadError {
 	}
 }
 
-pub fn download_file<P: AsRef<Path>>(url: hyper::Url, path: P, mut hasher: Option<&mut Hasher>) -> DownloadResult<()> {
+fn do_download(url: hyper::Url, mut file: fs::File, mut hasher: Option<&mut Hasher>, mut progress: &u32) -> Result<u32, DownloadError> {
+
 	let client = Client::new();
+	let headers = hyper::header::Header::new();
+
+	// Do a partial-content request. At first call progress == 0 so we ask for
+	// the whole file.
+	// If we fail to download an re-enter the loop, we won't start from 0
+	headers.set(Range::Bytes(vec![BytesRangeSpec::AllFrom(progress)]));
 
 	let mut res = try!(client.get(url).send().map_err(DownloadError::Network));
 	if res.status != hyper::Ok { return Err(DownloadError::Status(res.status)); }
-	
+
 	let buffer_size = 0x10000;
 	let mut buffer = vec![0u8; buffer_size];
-	
-	let mut file = try!(fs::File::create(path).map_err(DownloadError::File));
-	
+
 	loop {
 		let bytes_read = try!(io::Read::read(&mut res, &mut buffer)
 			.map_err(hyper::Error::Io)
 			.map_err(DownloadError::Network)
 			);
-		
+
+		progress += bytes_read;
+
 		if bytes_read != 0 {
 			if let Some(ref mut h) = hasher {
 				try!(io::Write::write_all(*h, &mut buffer[0..bytes_read]).map_err(DownloadError::File));
 			}
 			try!(io::Write::write_all(&mut file, &mut buffer[0..bytes_read]).map_err(DownloadError::File));
 		} else {
-			try!(file.sync_data().map_err(DownloadError::File));
 			return Ok(());
 		}
 	}
+}
+
+pub fn download_file<P: AsRef<Path>>(url: hyper::Url, path: P, mut hasher: Option<&mut Hasher>) -> DownloadResult<()> {
+
+	
+	let mut file = try!(fs::File::create(path).map_err(DownloadError::File));
+
+	let mut progress : u32 = 0;
+	let mut retries : u32 = 20; // abort when retries is 0
+	
+	loop {
+		match do_download(url, file, hasher, &progress) {
+			err @ Err(DownloadError::Network(_)) => {
+				if retries == 0 {
+					return err
+				} else {
+					retries -= 1;
+					// Could just be the network which is laggy
+					std::thread::sleep_ms(500);
+					continue
+				}
+			},
+			err @ Err(_) => return err,
+			Ok(_) => break
+		}
+	}
+	try!(file.sync_data().map_err(DownloadError::File));
 }
 
 pub fn symlink_dir(src: &Path, dest: &Path) -> io::Result<()> {
